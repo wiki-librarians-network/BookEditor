@@ -25,7 +25,7 @@
   /* ------------------------------------------------------------------ */
 
   const WS_BASE = 'https://ml.wikisource.org/wiki/';
-  const SUMMARY = 'Book data from Malayalam Wikisource via Wikisource → Wikidata book editor (#mlwsBookEditor)';
+  const SUMMARY = 'Book data from Wikisource via Wikisource → Wikidata book editor (#mlwsBookEditor)';
   const LS_SESSION = 'mlwsBE.session.v1';
   const LS_CACHE = 'mlwsBE.entityCache.v1';
   const Q_EDITION = 'Q3331189';
@@ -52,11 +52,15 @@
     { key: 'place', prop: 'P291', label: 'place of publication', type: 'item', ref: true, newP31: 'Q486972', guess: ['publication_place'] },
     { key: 'year', prop: 'P577', label: 'publication date', type: 'time', ref: true, guess: ['publication_year'] },
     { key: 'file', prop: 'P996', label: 'document file on Commons', type: 'commons', guess: ['index_page_title'] },
-    { key: 'pages', prop: 'P1104', label: 'number of pages', type: 'quantity', ref: true, guess: ['page_count'] },
+    {
+      key: 'pages', prop: 'P1104', label: 'number of pages', type: 'quantity', ref: true, always: true,
+      fallbackCols: ['page_count_from_pagelist', 'page_count_from_page_namespace', 'last_scan_page'], guess: ['page_count'],
+    },
   ];
 
   const NEW_P31 = [['', '(no instance of)'], ['Q5', 'human'], ['Q2085381', 'publishing house'], ['Q486972', 'human settlement']];
-  const PROP_LABELS = { P17: 'country', P2093: 'author name string' };
+  const PROP_LABELS = { P17: 'country', P21: 'sex or gender', P2093: 'author name string' };
+  const GENDERS = [['', 'not set'], ['Q6581097', 'male'], ['Q6581072', 'female']];
 
   const DV = { item: 'wikibase-entityid', url: 'string', commons: 'string', string: 'string', mono: 'monolingualtext', time: 'time', quantity: 'quantity' };
 
@@ -69,6 +73,8 @@
     [Q_EDITION]: { label: 'version, edition or translation', desc: '' },
     [Q_MALAYALAM]: { label: 'Malayalam', desc: '' },
     Q668: { label: 'India', desc: '' },
+    Q6581097: { label: 'male', desc: '' },
+    Q6581072: { label: 'female', desc: '' },
     Q2085381: { label: 'publishing house', desc: '' },
   };
   let cache = loadJSON(LS_CACHE, {});
@@ -370,8 +376,21 @@
           break;
         }
         case 'quantity': {
-          const n = parseInt(raw, 10);
-          if (raw) out.push(Object.assign(base, { n: n > 0 ? n : null }));
+          // Use the mapped column first, then the fallback columns; if all are blank the
+          // page count is read from the scanned file when the row loads (resolvePages).
+          let n = parseInt(raw, 10), from = raw ? S.map[f.key] : '';
+          if (!(n > 0)) {
+            for (const col of f.fallbackCols || []) {
+              const v = parseInt(String(row[col] == null ? '' : row[col]).trim(), 10);
+              if (v > 0) { n = v; from = col; break; }
+            }
+          }
+          if (n > 0 || f.always) {
+            out.push(Object.assign(base, {
+              n: n > 0 ? n : null, csv: n > 0 ? String(n) : '',
+              note: n > 0 ? (from && from !== S.map[f.key] ? `from ${from}` : '') : 'reading page count from the scan…',
+            }));
+          }
           break;
         }
       }
@@ -503,6 +522,23 @@
     await fetchLabels(p31s);
   }
   const score = c => c.methods.reduce((s, m) => s + (STRONG.has(m) ? 10 : m === 'exact label' ? 3 : 1), 0) + (c.isEdition ? 2 : 0);
+
+  // Fill P1104 from the scan's own page count when the file gave none.
+  async function resolvePages(cur) {
+    const st = cur.stmts.find(s => s.prop === 'P1104');
+    if (!st || st.n) return;
+    const idx = cellOf(cur.row, 'index');
+    const title = /^https?:/.test(idx) ? wsTitleFromUrl(idx) : idx;
+    const fileName = (title || '').replace(/^(സൂചിക|Index)\s*:\s*/i, '');
+    if (!fileName) { st.note = 'No page count – type it in'; return; }
+    try {
+      const r = await wsGet({ action: 'query', titles: 'File:' + fileName, prop: 'imageinfo', iiprop: 'size' });
+      const p = r.query && r.query.pages && r.query.pages[0];
+      const pc = p && p.imageinfo && p.imageinfo[0] && p.imageinfo[0].pagecount;
+      if (pc > 0) { st.n = pc; st.csv = String(pc); st.note = 'from the scanned file'; }
+      else st.note = 'No page count found – type it in';
+    } catch (e) { st.note = 'Could not read the page count – type it in'; }
+  }
 
   async function resolveFile(cur) {
     const st = cur.stmts.find(s => s.prop === 'P996');
@@ -655,11 +691,113 @@
   /* Row loading & navigation                                            */
   /* ------------------------------------------------------------------ */
 
+  /* ------------------------------------------------------------------ */
+  /* Fill blank cells from the Wikisource index page                     */
+  /* ------------------------------------------------------------------ */
+
+  // Columns the reader writes into when the file left them empty.
+  const ENRICH_COLS = {
+    title: 'book_title', titleRaw: 'book_title_raw', author: 'author', authorUrl: 'author_url',
+    translator: 'translator', editor: 'editor', publisher: 'publisher', place: 'publication_place',
+    year: 'publication_year', pages: 'page_count', fileFallback: 'source_file_url',
+  };
+  // Index template parameter → our field key.
+  const INDEX_PARAMS = {
+    title: 'title', author: 'author', translator: 'translator', editor: 'editor',
+    publisher: 'publisher', address: 'place', year: 'year',
+  };
+
+  function getWsApi() {
+    wsApi = wsApi || new mw.ForeignApi('https://ml.wikisource.org/w/api.php', { anonymous: true });
+    return wsApi;
+  }
+  const wsGet = params => new Promise((resolve, reject) => {
+    getWsApi().get(Object.assign({ formatversion: 2 }, params)).then(resolve, (code, data) =>
+      reject(new Error((data && data.error && data.error.info) || code)));
+  });
+
+  // Split the {{:MediaWiki:Proofreadpage_index_template |…}} call into named parameters.
+  function parseIndexTemplate(wt) {
+    const start = wt.search(/\{\{\s*:?\s*MediaWiki:Proofreadpage[_ ]index[_ ]template/i);
+    if (start < 0) return null;
+    const parts = []; let cur = '', braces = 0, links = 0;
+    for (let i = start; i < wt.length; i++) {
+      const two = wt.substr(i, 2);
+      if (two === '{{') { braces++; i++; if (braces > 1) cur += two; continue; }
+      if (two === '}}') { braces--; i++; if (braces === 0) { parts.push(cur); break; } cur += two; continue; }
+      if (two === '[[') { links++; i++; cur += two; continue; }
+      if (two === ']]') { links = Math.max(0, links - 1); i++; cur += two; continue; }
+      if (wt[i] === '|' && braces === 1 && links === 0) { parts.push(cur); cur = ''; continue; }
+      cur += wt[i];
+    }
+    const out = {};
+    parts.slice(1).forEach(part => {
+      const eq = part.indexOf('=');
+      if (eq > 0) out[part.slice(0, eq).trim().toLowerCase()] = part.slice(eq + 1).trim();
+    });
+    return out;
+  }
+  function stripWiki(v) {
+    return String(v || '')
+      .replace(/<!--[\s\S]*?-->/g, '')
+      .replace(/<ref[\s\S]*?(<\/ref>|\/>)/gi, '')
+      .replace(/\{\{[^{}]*\}\}/g, '')
+      .replace(/\[\[[^\]|]*\|([^\]]*)\]\]/g, '$1')
+      .replace(/\[\[([^\]]*)\]\]/g, '$1')
+      .replace(/\[https?:\/\/\S+\s+([^\]]*)\]/g, '$1')
+      .replace(/<[^>]+>/g, '')
+      .replace(/'{2,}/g, '')
+      .replace(/\s+/g, ' ').trim();
+  }
+
+  async function enrichRow(row) {
+    const idx = cellOf(row, 'index') || '';
+    const title = /^https?:/.test(idx) ? wsTitleFromUrl(idx) : idx;
+    if (!title) return false;
+    const r = await wsGet({ action: 'query', titles: title, prop: 'revisions', rvprop: 'content', rvslots: 'main' });
+    const page = r.query && r.query.pages && r.query.pages[0];
+    if (!page || page.missing) throw new Error(`Index page "${title}" was not found on ml.wikisource`);
+    const params = parseIndexTemplate(page.revisions[0].slots.main.content) || {};
+    const fill = (key, val) => {
+      val = (val || '').trim();
+      if (!val) return;
+      const col = S.map[key] || ENRICH_COLS[key];
+      if (!S.headers.includes(col)) S.headers.push(col);
+      if (!S.map[key]) S.map[key] = col;
+      if (!String(row[col] || '').trim()) row[col] = val;
+    };
+    Object.entries(INDEX_PARAMS).forEach(([param, key]) => fill(key, stripWiki(params[param])));
+    if (/\[\[/.test(params.title || '')) fill('titleRaw', params.title);
+    const authorLink = /\[\[\s*:?\s*((?:രചയിതാവ്|Author)\s*:[^\]|#]+)/i.exec(params.author || '');
+    if (authorLink) fill('authorUrl', WS_BASE + authorLink[1].trim().replace(/ /g, '_'));
+
+    // Page count and real file location (Commons or local) from the scanned file.
+    const fileName = title.replace(/^(സൂചിക|Index)\s*:\s*/i, '');
+    try {
+      const fr = await wsGet({ action: 'query', titles: 'File:' + fileName, prop: 'imageinfo', iiprop: 'size|url' });
+      const fp = fr.query && fr.query.pages && fr.query.pages[0];
+      const ii = fp && fp.imageinfo && fp.imageinfo[0];
+      if (ii) {
+        if (ii.pagecount) fill('pages', String(ii.pagecount));
+        if (ii.url) fill('fileFallback', ii.url);
+      }
+    } catch (e) { /* page count stays blank */ }
+    return true;
+  }
+  const needsEnrich = row => !row._enriched && !!cellOf(row, 'index') &&
+    !['title', 'author', 'publisher', 'year'].some(k => cellOf(row, k));
+
   async function loadRow(i) {
     if (i < 0 || i >= S.rows.length) return;
     const token = ++loadToken;
     S.idx = i; saveSession(); renderNav();
     const row = S.rows[i];
+    if (needsEnrich(row)) {
+      document.getElementById('wsbe-row').replaceChildren(h('div', { class: 'wsbe-card wsbe-muted' }, 'Reading the index page on ml.wikisource…'));
+      try { await enrichRow(row); row._enriched = true; saveSession(); renderMapping(); }
+      catch (e) { row._enrichErr = 'Could not read the index page: ' + e.message; }
+      if (token !== loadToken) return;
+    }
     const year = (cellOf(row, 'year').match(/\d{3,4}/) || [])[0] || '';
     const title = cellOf(row, 'title');
     const cur = S.cur = {
@@ -671,8 +809,8 @@
         en: year ? `${year} Malayalam edition` : '',
       },
     };
-    showMsg(''); renderRow();
-    const results = await Promise.allSettled([resolveFile(cur), resolveSitelink(cur), resolveParts(cur), resolveBook(cur)]);
+    showMsg(row._enrichErr || '', 'warn'); delete row._enrichErr; renderRow();
+    const results = await Promise.allSettled([resolveFile(cur), resolvePages(cur), resolveSitelink(cur), resolveParts(cur), resolveBook(cur)]);
     if (token !== loadToken) return;
     const err = results.find(r => r.status === 'rejected');
     if (err) showMsg(err.reason.message, 'error');
@@ -725,8 +863,24 @@
   /* Rendering                                                           */
   /* ------------------------------------------------------------------ */
 
-  const wsLink = t => h('a', { href: WS_BASE + encodeURIComponent(String(t).replace(/ /g, '_')), target: '_blank' }, t);
+  const wsLink = t => h('a', { href: WS_BASE + encodeURIComponent(String(t).replace(/ /g, '_')).replace(/%2F/g, '/'), target: '_blank' }, t);
   const propLink = p => h('a', { href: '/wiki/Property:' + p, target: '_blank' }, p);
+  // Small button that copies text (e.g. a QID) to the clipboard.
+  function copyBtn(text) {
+    const btn = h('button', { class: 'wsbe-btn wsbe-copy', type: 'button', title: `Copy ${text}` }, 'Copy ' + text);
+    btn.addEventListener('click', async () => {
+      let ok = false;
+      try { await navigator.clipboard.writeText(text); ok = true; } catch (e) {
+        const ta = h('textarea', { style: 'position:fixed;opacity:0' }); ta.value = text;
+        document.body.append(ta); ta.select();
+        try { ok = document.execCommand('copy'); } catch (e2) { ok = false; }
+        ta.remove();
+      }
+      btn.textContent = ok ? 'Copied ✓' : 'Copy failed';
+      setTimeout(() => { btn.textContent = 'Copy ' + text; }, 1500);
+    });
+    return btn;
+  }
   function qLink(id) {
     const l = labelOf(id);
     return h('span', null, h('a', { href: '/wiki/' + id, target: '_blank' }, l), l !== id ? h('span', { class: 'wsbe-muted' }, ` (${id})`) : null);
@@ -822,7 +976,7 @@
     if (cur.entity) {
       const e = cur.entity, p31 = claimIds(e, 'P31');
       card.append(h('div', { class: 'wsbe-item' },
-        h('strong', null, 'Book item: '), qLink(e.id),
+        h('strong', null, 'Book item: '), qLink(e.id), ' ', copyBtn(e.id),
         labels[e.id] && labels[e.id].desc ? h('span', { class: 'wsbe-muted' }, ' – ' + labels[e.id].desc) : null,
         cur.autoPicked ? h('span', { class: 'wsbe-badge' }, 'matched by ' + cur.autoPicked) : null,
         h('button', {
@@ -1023,8 +1177,17 @@
       const desc = h('input', { type: 'text', size: 30, value: st.newDesc || '', placeholder: 'description (optional)' });
       const p31 = h('select', null, NEW_P31.map(([q, t]) => h('option', { value: q, selected: q === (st.newP31 || '') }, q ? `${t} (${q})` : t)));
       const extras = (st.newClaims || []).map(([p, q]) => ({ p, q, box: h('input', { type: 'checkbox', checked: true }) }));
+      // Gender is offered for people (new items whose default instance of is human).
+      const isPerson = st.newP31 === 'Q5';
+      const gName = 'wsbe-g-' + Math.random().toString(36).slice(2);
+      const genderRadios = GENDERS.map(([q, t]) => ({ q, el: h('input', { type: 'radio', name: gName, value: q, checked: q === '' }), t }));
+      const genderRow = isPerson ? h('div', { class: 'wsbe-gender' }, `${PROP_LABELS.P21} (P21): `,
+        genderRadios.map(g => h('label', null, g.el, ' ' + g.t + (g.q ? ` (${g.q})` : '')))) : null;
+      const updateGender = () => { if (genderRow) genderRow.hidden = p31.value !== 'Q5'; };
+      p31.addEventListener('change', updateGender); updateGender();
       wrap.append(h('div', { class: 'wsbe-newform' },
         h('div', null, 'Label ', lab), h('div', null, 'Description ', desc), h('div', null, 'Instance of ', p31),
+        genderRow,
         extras.map(x => h('div', null, h('label', null, x.box, ` ${PROP_LABELS[x.p] || x.p} (${x.p}) → ${labelOf(x.q)} (${x.q})`))),
         h('button', {
           class: 'wsbe-btn wsbe-primary', disabled: S.cur.busy,
@@ -1034,6 +1197,8 @@
             const lang = hasMalayalam(text) ? 'ml' : 'en';
             const dlang = hasMalayalam(desc.value) ? 'ml' : 'en';
             const claims = [['P31', p31.value]].concat(extras.filter(x => x.box.checked).map(x => [x.p, x.q]));
+            const g = genderRadios.find(x => x.el.checked);
+            if (isPerson && p31.value === 'Q5' && g && g.q) claims.push(['P21', g.q]);
             setAsString(st, false);
             st.qid = await createItem(text, lang, { [dlang]: desc.value }, claims);
             st.how = 'newly created'; st.showNew = false; remember(st);
@@ -1069,6 +1234,8 @@
 #wsbe .wsbe-title{font-size:20px;font-weight:600;line-height:1.3}
 #wsbe .wsbe-item{margin-top:10px}
 #wsbe .wsbe-cand{border-top:1px solid var(--wb-line);padding:8px 0}
+#wsbe .wsbe-copy{font-family:monospace;padding:1px 8px}
+#wsbe .wsbe-gender label{margin-right:10px;white-space:nowrap}
 #wsbe .wsbe-badge{display:inline-block;font-size:11px;padding:1px 7px;border-radius:9px;background:var(--wb-soft);border:1px solid var(--wb-line);margin:2px 4px 2px 0;white-space:nowrap}
 #wsbe .b-match{color:#14866d;border-color:#14866d}
 #wsbe .b-missing{color:var(--wb-acc);border-color:var(--wb-acc)}
